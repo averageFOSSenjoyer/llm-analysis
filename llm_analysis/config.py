@@ -92,6 +92,7 @@ class GPUConfig:
     peak_i8_TFLOPS: float = None  # peak Tensor TFLOPS for INT8
     peak_i4_TFLOPS: float = None  # peak Tensor TFLOPS for INT4
     inter_node_bandwidth_in_GB_per_sec: float = 200  # inter node bandwidth in GB/s, assuming Mellanox 200Gbps HDR Infiniband
+    power_function: str = None
 
     def __post_init__(self):
         if self.peak_i8_TFLOPS is None:
@@ -217,6 +218,8 @@ def get_model_config_from_hf(name: str, ) -> ModelConfig:
         expansion_ratio = ffn_embed_dim / hidden_dim
         if expansion_ratio == 3.5:
             mlp_gated_linear_units = True
+        else:
+            mlp_gated_linear_units = False
     else:
         mlp_gated_linear_units = False
 

@@ -90,6 +90,7 @@ class LLMAnalysis:
         gpu_config: GPUConfig,
         dtype_config: DtypeConfig = DtypeConfig(),
         parallelism_config: ParallelismConfig = ParallelismConfig(),
+        calculate_gpu_power: bool = False,
         achieved_tflops: float = None,
         achieved_memory_bandwidth_GBs: float = None,
         flops_efficiency: float = None,
@@ -117,6 +118,14 @@ class LLMAnalysis:
         self.dtype_config = dtype_config
         self.intra_node_memory_efficiency = intra_node_memory_efficiency
         self.inter_node_memory_efficiency = inter_node_memory_efficiency
+        self.calculate_gpu_power = calculate_gpu_power
+        self.resource_utilization = {
+            k: {
+                "attn": [],
+                "mlp": [],
+                "layernorm": [],
+            } for k in ["mem", "cmp"]
+        }
 
         if achieved_memory_bandwidth_GBs and hbm_memory_efficiency:
             logger.info(
@@ -1090,6 +1099,15 @@ class LLMAnalysis:
             f" {round(weight_memory_latency*1000, 3)} +"
             f" {round(activation_memory_latency*1000, 3)}))")
 
+        self.resource_utilization["mem"]["attn"].append((
+            min(memory_latency / compute_latency, 1),
+            max(compute_latency, memory_latency)
+        ))
+        self.resource_utilization["cmp"]["attn"].append((
+            min(compute_latency / memory_latency, 1),
+            max(compute_latency, memory_latency)
+        ))
+
         return max(compute_latency, memory_latency)
 
     def get_latency_fwd_per_layer_mlp_moe_alltoall(self, batch_size: int,
@@ -1099,7 +1117,7 @@ class LLMAnalysis:
 
         latency = data_bytes / (
             (self.get_intra_node_bandwidth() if self.parallelism_config.ep_size
-             <= 8 else self.get_inter_node_bandwidth()) * 10**9)
+             <= NUM_GPUS_PER_NODE else self.get_inter_node_bandwidth()) * 10**9)
         logger.debug(
             f'moe_alltoall data_bytes = {_num_to_string(data_bytes)}B, latency = {round(latency*1000, 3)} ms'
         )
@@ -1163,6 +1181,15 @@ class LLMAnalysis:
         logger.debug(
             f'alltoall_latency = {round(alltoall_latency*1000, 3)} ms')
 
+        self.resource_utilization["mem"]["mlp"].append((
+            min(memory_latency / compute_latency, 1),
+            max(compute_latency, memory_latency)
+        ))
+        self.resource_utilization["cmp"]["mlp"].append((
+            min(compute_latency / memory_latency, 1),
+            max(compute_latency, memory_latency)
+        ))
+
         return max(compute_latency, memory_latency) + alltoall_latency
 
     def get_latency_fwd_per_layernorm(
@@ -1192,6 +1219,16 @@ class LLMAnalysis:
         )
         activation_memory_latency = activation_memory / (
             self.get_gpu_hbm_bandwidth() * 10**9)
+
+        self.resource_utilization["mem"]["layernorm"].append((
+            min(activation_memory_latency / compute_latency, 1),
+            max(compute_latency, activation_memory_latency)
+        ))
+        self.resource_utilization["cmp"]["layernorm"].append((
+            min(compute_latency / activation_memory_latency, 1),
+            max(compute_latency, activation_memory_latency)
+        ))
+
         return max(compute_latency, activation_memory_latency)
 
     def get_latency_fwd_per_tp_comm(self, batch_size: int, seq_len: int,
@@ -1219,8 +1256,12 @@ class LLMAnalysis:
                                 self.model_config.hidden_dim * (tp_size - 1) /
                                 tp_size)
         # assuming tp_size <= number of GPUs per node, thus using intra-node bandwidth
-        latency_per_all_reduce = (elems_per_all_reduce * dtype_bytes /
-                                  (self.get_intra_node_bandwidth() * 10**9))
+        if tp_size <= NUM_GPUS_PER_NODE:
+            latency_per_all_reduce = (elems_per_all_reduce * dtype_bytes /
+                                      (self.get_intra_node_bandwidth() * 10**9))
+        else:
+            latency_per_all_reduce = (elems_per_all_reduce * dtype_bytes /
+                                      (self.get_inter_node_bandwidth() * 10 ** 9))
 
         return max(
             latency_per_all_reduce,
@@ -1247,7 +1288,7 @@ class LLMAnalysis:
         # assuming tp and dp are preferred when sharding intra node, pp is only applied across nodes
         # when (dp_size * tp_size) <= 8, the data parallel processes are within a node
         bandwidth = self.get_intra_node_bandwidth() if (
-            dp_size * tp_size) <= 8 else self.get_inter_node_bandwidth()
+            dp_size * tp_size) <= NUM_GPUS_PER_NODE else self.get_inter_node_bandwidth()
 
         latency_allgather_params_mlp = time_allgather(params_bytes_mlp,
                                                       dp_size / ep_size,
@@ -1656,7 +1697,7 @@ class LLMAnalysis:
 
         logger.info("prefill_activation_memory_per_gpu with batch_size_per_gpu"
                     f" {batch_size_per_gpu}:"
-                    f" {_num_to_string(prefill_activation_memory_per_gpu)}B")
+                    f" max({_num_to_string(prefill_activation_memory_per_layer)}B, {_num_to_string(prefill_activation_memory_output_embedding)}B)")
         assert memory_left > prefill_activation_memory_per_gpu, (
             "prefill activation memory is too large with batch_size_per_gpu ="
             f" {batch_size_per_gpu} to fit in GPU memory(requiring"
@@ -1854,6 +1895,21 @@ class LLMAnalysis:
                 decode_cost_per_1k_tokens,
                 "total_cost_per_1k_tokens":
                 total_cost_per_1k_tokens
+            })
+
+        if self.calculate_gpu_power:
+            total_num_gpu = self.parallelism_config.pp_size * self.parallelism_config.tp_size * self.parallelism_config.ep_size
+            if self.gpu_config.power_function is not None:
+                power_function = lambda x: eval(self.gpu_config.power_function)
+                normalized_compute_utilization = (
+                    sum([u for _, v in self.resource_utilization["cmp"].items() for u in map(lambda x: x[0] * x[1], v) ]) /
+                    sum([u for _, v in self.resource_utilization["cmp"].items() for u in map(lambda x: x[1], v) ])
+                )
+                power_per_gpu = power_function(normalized_compute_utilization)
+            else:
+                power_per_gpu = 0
+            summary_dict.update({
+                "total_power": power_per_gpu * total_num_gpu,
             })
 
         logger.info(self.get_readable_summary_dict(summary_dict))
@@ -2509,6 +2565,7 @@ def infer(
     batch_size_per_gpu=1,
     ds_zero: int = 0,
     dp_size: int = 1,
+    ep_size: int = 1,
     tp_size: int = 1,
     pp_size: int = 1,
     sp_size: int = None,
@@ -2524,6 +2581,7 @@ def infer(
     intra_node_memory_efficiency=INTRA_NODE_MEMORY_EFFICIENCY,
     inter_node_memory_efficiency=INTER_NODE_MEMORY_EFFICIENCY,
     cost_per_gpu_hour: float = None,
+    calculate_gpu_power: bool = False,
     output_dir: str = None,
     output_file_prefix: str = "",
     output_file_suffix: str = "",
@@ -2552,6 +2610,7 @@ def infer(
         hbm_memory_efficiency (float, optional): GPU HBM memory efficiency, ranging from 0 to 1. Defaults to HBM_MEMORY_EFFICIENCY.
         intra_node_memory_efficiency (float, optional):  intra-node memory efficiency, ranging from 0 to 1. Defaults to INTRA_NODE_MEMORY_EFFICIENCY.
         inter_node_memory_efficiency (float, optional):  inter-node memory efficiency, ranging from 0 to 1. Defaults to INTER_NODE_MEMORY_EFFICIENCY.
+        calculate_gpu_power (bool, optional): whether to calculate total GPU power. Defaults to False.
         cost_per_gpu_hour (float, optional): dollar cost per GPU hour. Defaults to None.
         output_dir (str, optional): if set to a directory path, write the return summary dict out to the directory with the setup. Defaults to None.. Defaults to None.
         output_file_prefix (str, optional): prefix of the output file. Defaults to "".
@@ -2565,6 +2624,7 @@ def infer(
     gpu_config = get_gpu_config_by_name(gpu_name)
     dtype_config = get_dtype_config_by_name(dtype_name)
     parallel_config = ParallelismConfig(
+        ep_size=ep_size,
         tp_size=tp_size,
         pp_size=pp_size,
         sp_size=sp_size if sp_size else tp_size,
@@ -2577,6 +2637,7 @@ def infer(
         gpu_config,
         dtype_config,
         parallel_config,
+        calculate_gpu_power,
         achieved_tflops=achieved_tflops,
         achieved_memory_bandwidth_GBs=achieved_memory_bandwidth_GBs,
         flops_efficiency=flops_efficiency,

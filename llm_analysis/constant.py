@@ -34,7 +34,7 @@ INTRA_NODE_MEMORY_EFFICIENCY = 1.0  # intra-node (nvlink) memory efficiency
 INTER_NODE_MEMORY_EFFICIENCY = 1.0  # inter-node memory efficiency
 INTRA_NODE_ALLTOALL_EFFICIENCY = 1.0  # intra-node alltoall efficiency
 
-NUM_GPUS_PER_NODE = 8  # number of GPUs per node
+NUM_GPUS_PER_NODE = 48   # number of GPUs per node
 
 TOLERANCE = 0.01  # tolerance for floating point comparisons
 PRINT_LINE_WIDTH = 100
