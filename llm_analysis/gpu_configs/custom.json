@@ -1,0 +1,1 @@
+{"name": "custom", "mem_per_GPU_in_GB": 216.0, "hbm_bandwidth_in_GB_per_sec": 7200.0, "intra_node_bandwidth_in_GB_per_sec": 1450.0, "intra_node_min_message_latency": 8e-06, "peak_fp16_TFLOPS": 1979, "peak_i8_TFLOPS": 3958, "peak_i4_TFLOPS": 3958, "inter_node_bandwidth_in_GB_per_sec": 1450.0, "power_function": "50 + 550 * x ** 2"}

@@ -91,6 +91,7 @@ class LLMAnalysis:
         dtype_config: DtypeConfig = DtypeConfig(),
         parallelism_config: ParallelismConfig = ParallelismConfig(),
         calculate_gpu_power: bool = False,
+        num_gpus_per_node: int = 8,
         achieved_tflops: float = None,
         achieved_memory_bandwidth_GBs: float = None,
         flops_efficiency: float = None,
@@ -126,6 +127,7 @@ class LLMAnalysis:
                 "layernorm": [],
             } for k in ["mem", "cmp"]
         }
+        self.num_gpus_per_node = num_gpus_per_node
 
         if achieved_memory_bandwidth_GBs and hbm_memory_efficiency:
             logger.info(
@@ -283,6 +285,7 @@ class LLMAnalysis:
             self.model_config.num_key_value_heads /
             self.parallelism_config.tp_size,
             1)  # At least on attention head on each tensor-parallel GPU
+        # num_heads_per_gpu = self.model_config.num_key_value_heads / self.parallelism_config.tp_size
         num_key_value_heads = num_heads_per_gpu * self.parallelism_config.tp_size
 
         return 2 * self.model_config.hidden_dim**2 + 2 * self.model_config.hidden_dim * (
@@ -1117,7 +1120,7 @@ class LLMAnalysis:
 
         latency = data_bytes / (
             (self.get_intra_node_bandwidth() if self.parallelism_config.ep_size
-             <= NUM_GPUS_PER_NODE else self.get_inter_node_bandwidth()) * 10**9)
+             <= self.num_gpus_per_node else self.get_inter_node_bandwidth()) * 10**9)
         logger.debug(
             f'moe_alltoall data_bytes = {_num_to_string(data_bytes)}B, latency = {round(latency*1000, 3)} ms'
         )
@@ -1256,7 +1259,7 @@ class LLMAnalysis:
                                 self.model_config.hidden_dim * (tp_size - 1) /
                                 tp_size)
         # assuming tp_size <= number of GPUs per node, thus using intra-node bandwidth
-        if tp_size <= NUM_GPUS_PER_NODE:
+        if tp_size <= self.num_gpus_per_node:
             latency_per_all_reduce = (elems_per_all_reduce * dtype_bytes /
                                       (self.get_intra_node_bandwidth() * 10**9))
         else:
@@ -1288,7 +1291,7 @@ class LLMAnalysis:
         # assuming tp and dp are preferred when sharding intra node, pp is only applied across nodes
         # when (dp_size * tp_size) <= 8, the data parallel processes are within a node
         bandwidth = self.get_intra_node_bandwidth() if (
-            dp_size * tp_size) <= NUM_GPUS_PER_NODE else self.get_inter_node_bandwidth()
+            dp_size * tp_size) <= self.num_gpus_per_node else self.get_inter_node_bandwidth()
 
         latency_allgather_params_mlp = time_allgather(params_bytes_mlp,
                                                       dp_size / ep_size,
@@ -1431,6 +1434,10 @@ class LLMAnalysis:
                            (self.get_TFLOPS_per_gpu() * 10**12))
         return compute_latency
 
+    def get_latency_pipestage_comm(self, batch_size, seq_len):
+        num_bytes_to_send = batch_size * self.model_config.hidden_dim * seq_len * self.dtype_config.embedding_bits / BITS_PER_BYTE
+        return num_bytes_to_send / (self.get_inter_node_bandwidth() * 10**9)
+
     def get_latency_fwd(
         self,
         batch_size: int,
@@ -1484,8 +1491,13 @@ class LLMAnalysis:
         latency_fwd_output_embedding_loss = (
             self.get_latency_fwd_output_embedding_loss(batch_size, seq_len))
 
-        latency_fwd = (latency_fwd_layers + latency_fwd_input_embedding +
-                       latency_fwd_output_embedding_loss)
+        if self.parallelism_config.pp_size != 1:
+            latency_pipestage_comm = self.get_latency_pipestage_comm(batch_size, seq_len) * self.parallelism_config.pp_size
+        else:
+            latency_pipestage_comm = 0
+
+        latency_fwd = max((latency_fwd_layers + latency_fwd_input_embedding +
+                       latency_fwd_output_embedding_loss), latency_pipestage_comm)
 
         logger.info("latency_fwd_layers:"
                     f" {round(latency_fwd_layers*1000, 3)} ms"
@@ -1911,6 +1923,16 @@ class LLMAnalysis:
             summary_dict.update({
                 "total_power": power_per_gpu * total_num_gpu,
             })
+
+        normalized_memory_utilization = (
+            sum([u for _, v in self.resource_utilization["mem"].items() for u in map(lambda x: x[0] * x[1], v)]) /
+            sum([u for _, v in self.resource_utilization["mem"].items() for u in map(lambda x: x[1], v)])
+        )
+        summary_dict.update({
+            "memory_utilization": normalized_memory_utilization,
+            "garbage": 0
+        })
+
 
         logger.info(self.get_readable_summary_dict(summary_dict))
 
@@ -2580,6 +2602,7 @@ def infer(
     hbm_memory_efficiency: float = None,
     intra_node_memory_efficiency=INTRA_NODE_MEMORY_EFFICIENCY,
     inter_node_memory_efficiency=INTER_NODE_MEMORY_EFFICIENCY,
+    num_gpus_per_node: int = 8,
     cost_per_gpu_hour: float = None,
     calculate_gpu_power: bool = False,
     output_dir: str = None,
@@ -2610,6 +2633,7 @@ def infer(
         hbm_memory_efficiency (float, optional): GPU HBM memory efficiency, ranging from 0 to 1. Defaults to HBM_MEMORY_EFFICIENCY.
         intra_node_memory_efficiency (float, optional):  intra-node memory efficiency, ranging from 0 to 1. Defaults to INTRA_NODE_MEMORY_EFFICIENCY.
         inter_node_memory_efficiency (float, optional):  inter-node memory efficiency, ranging from 0 to 1. Defaults to INTER_NODE_MEMORY_EFFICIENCY.
+        num_gpus_per_node (int, optional): # gpus per node, defaults to 8
         calculate_gpu_power (bool, optional): whether to calculate total GPU power. Defaults to False.
         cost_per_gpu_hour (float, optional): dollar cost per GPU hour. Defaults to None.
         output_dir (str, optional): if set to a directory path, write the return summary dict out to the directory with the setup. Defaults to None.. Defaults to None.
@@ -2638,6 +2662,7 @@ def infer(
         dtype_config,
         parallel_config,
         calculate_gpu_power,
+        num_gpus_per_node,
         achieved_tflops=achieved_tflops,
         achieved_memory_bandwidth_GBs=achieved_memory_bandwidth_GBs,
         flops_efficiency=flops_efficiency,
